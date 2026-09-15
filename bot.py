@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
@@ -606,7 +606,7 @@ def start_health_server():
     """Поднимает HTTP-ответ на PORT, пока бот работает в режиме polling."""
     def run():
         try:
-            srv = HTTPServer(("0.0.0.0", PORT), _Health)
+            srv = ThreadingHTTPServer(("0.0.0.0", PORT), _Health)
             log.info("Health-сервер слушает порт %s", PORT)
             srv.serve_forever()
         except Exception as e:
