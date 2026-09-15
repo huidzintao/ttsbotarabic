@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram-бот озвучки арабских диалогов через Gemini TTS.
+Telegram-бот озвучки арабских диалогов.
 
 Что умеет:
 1. Принимает ТЕКСТ диалога на арабском -> определяет персонажей и их пол/возраст -> озвучивает в MP3.
-2. Принимает ФОТО/скрин диалога -> распознаёт текст (OCR через Gemini) -> то же самое.
+2. Принимает ФОТО/скрин диалога -> распознаёт текст (OCR через нейросеть) -> то же самое.
 3. Перед генерацией показывает кнопки: пользователь одним нажатием меняет пол/возраст персонажа.
 """
 
@@ -49,8 +49,8 @@ def _req(name: str) -> str:
 
 
 TG_TOKEN = _req("TG_TOKEN")                             # токен от @BotFather
-GEMINI_API_KEY = _req("GEMINI_API_KEY")                 # ключ из aistudio.google.com
-# ВАЖНО: Google периодически закрывает старые модели для новых аккаунтов.
+GEMINI_API_KEY = _req("GEMINI_API_KEY")                 # ключ сервиса озвучки
+# ВАЖНО: провайдер периодически закрывает старые модели для новых аккаунтов.
 # Поэтому у каждой модели есть основной id и цепочка запасных: при ошибке 404
 # код сам пробует следующую, править ничего не нужно.
 TTS_MODEL = os.environ.get("TTS_MODEL", "gemini-2.5-flash-preview-tts")
@@ -70,7 +70,7 @@ MAX_CHARS = int(os.environ.get("MAX_CHARS", "4000"))
 # По умолчанию 0: не теряем сообщения, отправленные пока сервис спал.
 DROP_PENDING = os.environ.get("DROP_PENDING", "0") == "1"
 
-# ---- Лимиты FREE TIER Gemini: 3 TTS-запроса в минуту на проект ----
+# ---- Лимиты бесплатного тарифа: 3 запроса озвучки в минуту на проект ----
 # Поэтому озвучка идёт «по одной реплике с паузой», а не пачкой.
 TTS_RPM_LIMIT = int(os.environ.get("TTS_RPM_LIMIT", "3"))
 TTS_MIN_INTERVAL = float(os.environ.get("TTS_MIN_INTERVAL", "22"))  # сек между запросами
@@ -96,7 +96,7 @@ def _is_quota(exc: Exception) -> bool:
 
 
 def _parse_retry_delay(exc: Exception, default: float = 25.0) -> float:
-    """Достаёт из ответа Google рекомендованную паузу ('retryDelay': '34s')."""
+    """Достаёт из ответа сервиса рекомендованную паузу ('retryDelay': '34s')."""
     s = str(exc)
     m = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", s)
     if not m:
@@ -162,7 +162,7 @@ def call_tts_model(contents, config):
             raise
     raise last_err
 
-# ----------------------- ГОЛОСА (30 пресетов Gemini TTS) -----------------------
+# ----------------------- ГОЛОСА (30 пресетов) -----------------------
 ROLE_VOICE = {
     "m-mid":   ("Charon",     "Speak as a calm 50-year-old Arabic male teacher, warm and informative"),
     "m-young": ("Puck",       "Speak as a young Arabic man, 25 years old, upbeat and friendly"),
@@ -238,7 +238,16 @@ def build_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     for i, sp in enumerate(st["order"]):
         rows.append([InlineKeyboardButton(
             f"{sp}: {TAG_LABEL[st['tags'][sp]]}", callback_data=f"tgl:{i}")])
-    rows.append([InlineKeyboardButton("✅ Озвучить", callback_data="gen")])
+    done = st.get("cursor", 0)
+    total = len(st["utterances"])
+    if done <= 0:
+        label = "✅ Озвучить"
+    elif done < total:
+        label = (f"▶️ Продолжить (реплики {done + 1}–"
+                 f"{min(done + TTS_MAX_CHUNKS, total)} из {total})")
+    else:
+        label = "🔄 Озвучить заново (с начала)"
+    rows.append([InlineKeyboardButton(label, callback_data="gen")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -275,7 +284,8 @@ async def present(chat_id: int, utts, context: ContextTypes.DEFAULT_TYPE):
         if c["speaker"] not in order:
             order.append(c["speaker"])
             tags[c["speaker"]] = c["tag"]
-    PENDING[chat_id] = {"utterances": clean, "order": order, "tags": tags}
+    PENDING[chat_id] = {"utterances": clean, "order": order, "tags": tags,
+                        "cursor": 0, "pcm_parts": []}
     await context.bot.send_message(chat_id, summary_text(chat_id),
                                    reply_markup=build_keyboard(chat_id))
 
@@ -285,7 +295,7 @@ async def present(chat_id: int, utts, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "السلام عليكم! 👋\n\n"
-        "Я озвучиваю арабские диалоги голосами Gemini TTS.\n\n"
+        "Я озвучиваю арабские диалоги и присылаю готовый MP3.\n\n"
         "Что прислать:\n"
         "1️⃣ Текст диалога на арабском — сам определю, кто говорит (шейх/мать/ребёнок), "
         "и предложу голоса.\n"
@@ -308,7 +318,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         utts = tag_text(text)
     except Exception as e:
         log.exception("tag_text failed")
-        await update.message.reply_text(f"Не смог разобрать диалог: {e}")
+        await update.message.reply_text(
+            "Не смог разобрать диалог. Пришли его ещё раз или разбей на две части.")
         return
     await present(update.message.chat_id, utts, context)
 
@@ -325,7 +336,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("tag_photo failed")
         await msg.reply_text(
-            f"Не смог распознать текст на фото: {e}\n"
+            "Не смог распознать текст на фото.\n"
             "Попробуй фото поярче или пришли текстом.")
         return
     await present(msg.chat_id, utts, context)
@@ -347,6 +358,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for u in st["utterances"]:
             if u["speaker"] == sp:
                 u["tag"] = st["tags"][sp]
+        # Смена голоса обнуляет собранные куски: иначе в одном файле
+        # встретятся старый и новый тембр одного и того же персонажа.
+        st["cursor"] = 0
+        st["pcm_parts"] = []
         await q.edit_message_text(summary_text(chat_id),
                                   reply_markup=build_keyboard(chat_id))
     elif q.data == "gen":
@@ -357,7 +372,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------- TTS -----------------------
 
 def tts_utterance(text: str, tag: str) -> bytes:
-    """Одна реплика. При 429 ждёт столько, сколько просит Google, и повторяет."""
+    """Одна реплика. При 429 ждёт столько, сколько просит сервис, и повторяет."""
     voice, instr = ROLE_VOICE[tag]
     prompt = (f"{instr}. Modern Standard Arabic (fusha), clear diction, "
               f"natural pace: {text}")
@@ -389,45 +404,53 @@ async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         return
     global _last_tts_call
 
-    utts = st["utterances"]
-    total = len(utts)
+    all_utts = st["utterances"]
+    total = len(all_utts)
+    start = st.get("cursor", 0)
+    if start >= total:            # весь диалог уже озвучен -> начинаем заново
+        start = 0
+        st["pcm_parts"] = []
+    end = min(start + TTS_MAX_CHUNKS, total)
+    batch = all_utts[start:end]
+    st["cursor"] = start
+
     if total > TTS_MAX_CHUNKS:
-        utts = utts[:TTS_MAX_CHUNKS]
         await context.bot.send_message(
             chat_id,
-            f"ℹ️ В диалоге {total} реплик — за один прогон озвучиваю первые "
-            f"{TTS_MAX_CHUNKS} (ограничение free tier Gemini). "
-            f"Пришли остаток отдельным сообщением.")
-    silence = b"\x00\x00" * int(24000 * 0.45)  # 0.45 сек между репликами
-    chunks = []
+            f"ℹ️ В диалоге {total} реплик. Озвучиваю частями по "
+            f"{TTS_MAX_CHUNKS}, но всё складываю в ОДИН общий файл. "
+            f"Сейчас — реплики {start + 1}–{end}.")
 
-    est_min = max(0.0, (len(utts) - 1) * TTS_MIN_INTERVAL) / 60.0
+    est_min = max(0.0, (len(batch) - 1) * TTS_MIN_INTERVAL) / 60.0
     if est_min >= 0.4:
         await context.bot.send_message(
             chat_id,
-            f"🐢 Free tier Gemini даёт {TTS_RPM_LIMIT} TTS-запроса в минуту, "
-            f"поэтому {len(utts)} реплик озвучиваются по очереди "
-            f"(≈{est_min:.1f} мин). Не закрывай чат — пришлю MP3, когда закончу.")
+            "⏳Сабр — это половина веры.Озвучка идёт в несколько заходов, "
+            "потом склеиваю. Жду — и ты жди.")
     try:
-        for i, u in enumerate(utts, 1):
+        for n, u in enumerate(batch, 1):
+            pos = start + n
             wait = TTS_MIN_INTERVAL - (time.monotonic() - _last_tts_call)
-            if wait > 5 and i > 1:
+            if wait > 5 and n > 1:
                 await context.bot.send_message(
-                    chat_id, f"⏳ Жду {wait:.0f} сек, чтобы не упереться "
-                             f"в лимит… затем реплика {i}/{len(utts)}")
+                    chat_id, f"⏳ Реплика {pos}/{total} — готовлю звук…")
             if wait > 0:
                 await asyncio.sleep(wait)
-            chunks.append(tts_utterance(u["text"], u["tag"]))
+            st["pcm_parts"].append(tts_utterance(u["text"], u["tag"]))
             _last_tts_call = time.monotonic()
-            if i % 3 == 0:
+            st["cursor"] = pos      # при сбое продолжим с этого места
+            if n % 3 == 0:
                 await context.bot.send_message(
-                    chat_id, f"⏳ {i}/{len(utts)} реплик готово…")
+                    chat_id, f"⏳ {pos}/{total} реплик готово…")
     except Exception as e:
         log.exception("tts failed")
-        await context.bot.send_message(chat_id, f"Ошибка TTS: {e}")
+        await context.bot.send_message(
+            chat_id, "Не получилось озвучить: временный сбой. "
+                     "Попробуй ещё раз через минуту.")
         return
 
-    pcm = silence.join(chunks)
+    silence = b"\x00\x00" * int(24000 * 0.45)  # 0.45 сек между репликами
+    pcm = silence.join(st["pcm_parts"])
     with tempfile.TemporaryDirectory() as td:
         wav_path = os.path.join(td, "out.wav")
         mp3_path = os.path.join(td, "out.mp3")
@@ -444,9 +467,21 @@ async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             mp3 = f.read()
 
     speakers = " | ".join(f"{sp}={TAG_LABEL[st['tags'][sp]]}" for sp in st["order"])
+    done = st["cursor"]
+    if done < total:
+        cap = (f"🎧 Реплики 1–{done} из {total} · {speakers}\n"
+               f"Файл пока неполный — нажми «▶️ Продолжить», "
+               f"и я допишу следующие реплики в этот же диалог.")
+    else:
+        cap = f"🎧 Весь диалог целиком ({total} реплик) · {speakers}"
     await context.bot.send_audio(chat_id, audio=mp3,
                                  title="Озвучка диалога",
-                                 caption=f"🎧 {speakers}"[:1000])
+                                 caption=cap[:1000])
+    if done < total:
+        await context.bot.send_message(
+            chat_id,
+            f"Осталось реплик: {total - done}. Продолжаем?",
+            reply_markup=build_keyboard(chat_id))
 
 
 # ----------------------- ЗАПУСК -----------------------
