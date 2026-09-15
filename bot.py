@@ -10,6 +10,7 @@ Telegram-бот озвучки арабских диалогов.
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -49,7 +50,11 @@ def _req(name: str) -> str:
 
 
 TG_TOKEN = _req("TG_TOKEN")                             # токен от @BotFather
-GEMINI_API_KEY = _req("GEMINI_API_KEY")                 # ключ сервиса озвучки
+GEMINI_API_KEYS = [k.strip() for k in os.environ.get(
+    "GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", "")).split(",")
+    if k.strip()]
+if not GEMINI_API_KEYS:
+    GEMINI_API_KEYS = [_req("GEMINI_API_KEY")]   # понятная диагностика
 # ВАЖНО: провайдер периодически закрывает старые модели для новых аккаунтов.
 # Поэтому у каждой модели есть основной id и цепочка запасных: при ошибке 404
 # код сам пробует следующую, править ничего не нужно.
@@ -78,7 +83,239 @@ TTS_MAX_CHUNKS = int(os.environ.get("TTS_MAX_CHUNKS", "8"))        # репли�
 TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", "3"))
 _last_tts_call = 0.0  # время последнего TTS-запроса (для ограничителя темпа)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# ---------------- КЛЮЧИ: автоматическая ротация ----------------
+# Лимиты сервиса считаются НА ПРОЕКТ, а не на ключ. Несколько ключей одного
+# проекта лимит НЕ увеличивают — свободных запросов больше становится только
+# за счёт РАЗНЫХ проектов/аккаунтов. Ротация ниже — ровно для такого случая.
+class AllKeysExhausted(Exception):
+    """Все ключи исчерпали суточную квоту (сброс — полночь по Тихоокеанскому времени)."""
+
+
+_clients = {k: genai.Client(api_key=k) for k in GEMINI_API_KEYS}
+# Метки исчерпания ключей хранит общий счётчик (см. блок «ОБЩИЙ СЧЁТЧИК» ниже).
+_key_cursor = [0]
+_key_in_use = [GEMINI_API_KEYS[0]]
+
+
+def _mask(key: str) -> str:
+    return f"{key[:6]}…{key[-4:]}" if len(key) > 12 else "ключ"
+
+
+def _next_midnight_pt() -> float:
+    """Ближайшая полночь по Тихоокеанскому времени — момент сброса суточных квот."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Los_Angeles")
+    except Exception:
+        tz = timezone(timedelta(hours=-7))
+    now = datetime.now(tz)
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=5,
+                                            second=0, microsecond=0)
+    return nxt.timestamp()
+
+
+def _is_daily_quota(err: Exception) -> bool:
+    """Отличает СУТОЧНЫЙ лимит (RPD) от МИНУТНОГО (RPM)."""
+    s = str(err)
+    return ("PerDay" in s) or ("RequestsPerDay" in s) or ("per day" in s.lower())
+
+
+def _pick_key() -> str:
+    now = time.time()
+    for step in range(len(GEMINI_API_KEYS)):
+        i = (_key_cursor[0] + step) % len(GEMINI_API_KEYS)
+        k = GEMINI_API_KEYS[i]
+        if key_blocked_until(k) <= now:
+            _key_cursor[0] = i
+            return k
+    return GEMINI_API_KEYS[_key_cursor[0]]
+
+
+def active_key() -> str:
+    return _key_in_use[0]
+
+
+def call_model(model: str, contents, config=None, kind: str = "tts"):
+    """Один запрос с перебором ключей: ключ исчерпал СУТОЧНУЮ квоту —
+    помечаем его до сброса и молча берём следующий."""
+    now = time.time()
+    if all(key_blocked_until(k) > now for k in GEMINI_API_KEYS):
+        raise AllKeysExhausted("все ключи исчерпали суточную квоту")
+    last_err = None
+    tried = set()
+    for _ in range(len(GEMINI_API_KEYS)):
+        key = _pick_key()
+        if key in tried:
+            break
+        tried.add(key)
+        try:
+            kw = {"model": model, "contents": contents}
+            if config is not None:
+                kw["config"] = config
+            r = _clients[key].models.generate_content(**kw)
+            _bump(key, kind)
+            if _key_in_use[0] != key:
+                log.info("Переключился на резервный ключ %s", _mask(key))
+                _key_in_use[0] = key
+            return r
+        except Exception as e:
+            last_err = e
+            _bump(key, kind)          # отказ по лимиту тоже расходует квоту
+            if _is_quota(e) and _is_daily_quota(e):
+                _block(key, _next_midnight_pt())
+                free = sum(1 for k in GEMINI_API_KEYS
+                           if key_blocked_until(k) <= time.time())
+                log.warning("Ключ %s исчерпал суточную квоту; свободных ещё: %d",
+                            _mask(key), free)
+                continue
+            raise
+    if _is_quota(last_err) and _is_daily_quota(last_err):
+        raise AllKeysExhausted("все ключи исчерпали суточную квоту") from last_err
+    raise last_err
+
+
+# ---------------- ОБЩИЙ СЧЁТЧИК ЛИМИТА (скрытно от пользователя) ----------------
+# Пользователь видит только «озвучено X из Y» и время следующей доступной
+# озвучки. Ни одного слова о ключах, их числе или ротации наружу не уходит.
+# Состояние — JSON рядом с ботом. ВАЖНО: на бесплатном тарифе хостинга диск
+# непостоянный: при перезапуске/передеплое счётчик обнуляется.
+STATE_FILE = os.environ.get("STATE_FILE", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "usage_state.json"))
+RPD_PER_PROJECT = int(os.environ.get("RPD_PER_PROJECT", "10"))  # озвучек в сутки на один источник
+TZ_NAME = os.environ.get("TZ_NAME", "Europe/Moscow")            # часовой пояс пользователя
+KEY_ID = {k: hashlib.sha1(k.encode()).hexdigest()[:10] for k in GEMINI_API_KEYS}
+_state_lock = threading.Lock()
+_state = {"day": "", "keys": {}}
+
+
+def _user_tz():
+    from datetime import timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(TZ_NAME)
+    except Exception:
+        return timezone(timedelta(hours=3))
+
+
+def _fmt_local(ts: float) -> str:
+    """Момент времени по часам пользователя."""
+    from datetime import datetime
+    return datetime.fromtimestamp(ts, _user_tz()).strftime("%d.%m в %H:%M")
+
+
+def _pt_day() -> str:
+    """Дата по Тихоокеанскому времени: в полночь по нему сбрасываются квоты."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    except Exception:
+        from datetime import datetime as d, timedelta, timezone
+        return d.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
+
+
+def _blank_state(day: str) -> dict:
+    return {"day": day,
+            "keys": {kid: {"used": 0, "until": 0.0} for kid in KEY_ID.values()}}
+
+
+def _load_state() -> None:
+    global _state
+    day = _pt_day()
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            cur = json.load(f)
+    except Exception:
+        cur = None
+    if not isinstance(cur, dict) or cur.get("day") != day:
+        _state = _blank_state(day)
+        return
+    for kid in KEY_ID.values():
+        cur.setdefault("keys", {}).setdefault(kid, {"used": 0, "until": 0.0})
+    _state = cur
+
+
+def _save_state() -> None:
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_state, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log.warning("счётчик не сохранён: %s", e)
+
+
+def _rollover() -> None:
+    """Новые тихоокеанские сутки -> счётчики и метки обнуляются."""
+    global _state
+    if _state.get("day") != _pt_day():
+        _state = _blank_state(_pt_day())
+
+
+def _entry(key: str) -> dict:
+    return _state["keys"].setdefault(KEY_ID[key], {"used": 0, "until": 0.0})
+
+
+def _bump(key: str, kind: str) -> None:
+    """+1 к числу попыток: считаем и удачные, и отклонённые по лимиту запросы."""
+    try:
+        with _state_lock:
+            _rollover()
+            e = _entry(key)
+            e["used"] = int(e.get("used", 0)) + 1
+            _save_state()
+    except Exception as ex:
+        log.warning("счётчик недоступен: %s", ex)
+
+
+def _block(key: str, until: float) -> None:
+    """Ключ исчерпал суточную квоту; после указанного момента он снова свободен."""
+    try:
+        with _state_lock:
+            _rollover()
+            _entry(key)["until"] = float(until)
+            _save_state()
+    except Exception as ex:
+        log.warning("не смог отметить лимит: %s", ex)
+
+
+def key_blocked_until(key: str) -> float:
+    with _state_lock:
+        _rollover()
+        return float(_entry(key).get("until", 0.0))
+
+
+def quota_snapshot() -> dict:
+    """Сводка без единого упоминания ключей: только цифры и время."""
+    now = time.time()
+    with _state_lock:
+        _rollover()
+        used = sum(int(e.get("used", 0)) for e in _state["keys"].values())
+        untils = [float(e.get("until", 0.0)) for e in _state["keys"].values()]
+    total = max(1, len(GEMINI_API_KEYS) * RPD_PER_PROJECT)
+    blocked = [u for u in untils if u > now]
+    all_out = (bool(untils) and all(u > now for u in untils)) or used >= total
+    if blocked:
+        nxt = min(blocked)
+    elif all_out:
+        nxt = _next_midnight_pt()
+    else:
+        nxt = 0.0
+    return {"used": used, "total": total, "left": max(0, total - used),
+            "all_exhausted": bool(all_out), "next_available": nxt}
+
+
+def _quota_footer() -> str:
+    """Строка под готовым аудио: сколько израсходовано и когда будет снова."""
+    s = quota_snapshot()
+    if s["all_exhausted"]:
+        return (f"⏳ Лимит озвучки на сегодня исчерпан. Следующая озвучка будет "
+                f"доступна после {_fmt_local(s['next_available'])} (по вашему времени).")
+    return (f"📊 Озвучено сегодня: {s['used']} из {s['total']} · осталось {s['left']}")
+
+
+_load_state()
 
 
 # ----------------------- ВЫБОР МОДЕЛИ С ЗАПАСНЫМИ ВАРИАНТАМИ -----------------------
@@ -90,6 +327,8 @@ def _is_model_gone(exc: Exception) -> bool:
 
 def _is_quota(exc: Exception) -> bool:
     """True для 429 / RESOURCE_EXHAUSTED — временный лимит запросов."""
+    if isinstance(exc, AllKeysExhausted):
+        return False
     s = str(exc)
     return (("429" in s) or ("RESOURCE_EXHAUSTED" in s)
             or ("exceeded your current quota" in s))
@@ -136,7 +375,7 @@ def call_text_model(contents):
     for m in _model_chain(TEXT_MODEL, TEXT_MODEL_FALLBACKS, "text"):
         for attempt in range(2):
             try:
-                r = client.models.generate_content(model=m, contents=contents)
+                r = call_model(m, contents, kind="text")
                 _remember("text", m)
                 return r
             except Exception as e:
@@ -158,8 +397,7 @@ def call_tts_model(contents, config):
     last_err = None
     for m in _model_chain(TTS_MODEL, TTS_MODEL_FALLBACKS, "tts"):
         try:
-            r = client.models.generate_content(model=m, contents=contents,
-                                               config=config)
+            r = call_model(m, contents, config, kind="tts")
             _remember("tts", m)
             return r
         except Exception as e:
@@ -304,12 +542,25 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка связи с сервисами: какая модель разметки сейчас отвечает."""
     try:
         await asyncio.to_thread(call_text_model, "Ответь одним словом: ок")
-        await update.message.reply_text(
-            f"✅ Разбор текста работает (модель: {_RESOLVED.get('text') or TEXT_MODEL}).")
+        await update.message.reply_text("✅ Озвучка и разбор диалога работают.")
     except Exception as e:
-        hint = _tag_error_text(e)
         await update.message.reply_text(
-            f"❌ Разбор текста не отвечает.\n{hint}")
+            "❌ Сервис сейчас не отвечает.\n" + _tag_error_text(e))
+
+
+async def limits_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Общий лимит озвучки на сутки — без каких-либо данных о ключах."""
+    s = quota_snapshot()
+    lines = [f"Сегодня озвучено: {s['used']} из {s['total']}",
+             f"Осталось озвучек: {s['left']}"]
+    if s["all_exhausted"]:
+        lines += ["", "⏳ Лимит на сегодня исчерпан.",
+                  "Следующая озвучка будет доступна после "
+                  + _fmt_local(s["next_available"]) + " (по вашему времени)."]
+    else:
+        lines += ["", "Лимит обновляется каждый день в 00:00 по тихоокеанскому "
+                      "времени.", "Пока лимит есть — просто пришли диалог."]
+    await update.message.reply_text("📊 Общий лимит озвучки\n" + "\n".join(lines))
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,12 +578,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "и предложу голоса.\n"
         "2️⃣ Фото/скрин страницы учебника — распознаю текст и сделаю то же самое.\n\n"
         "Перед генерацией покажу кнопки: пол/возраст любого персонажа можно поменять "
-        "одним нажатием. Потом пришлю готовый MP3 🎧"
+        "одним нажатием. Потом пришлю готовый MP3 🎧\n\n"
+        "Проверить общий лимит на сутки: /limits"
     )
 
 
 def _tag_error_text(err: Exception, photo: bool = False) -> str:
     """Сообщение об ошибке разметки с понятной причиной (без служебных названий)."""
+    if isinstance(err, AllKeysExhausted):
+        s = quota_snapshot()
+        when = _fmt_local(s["next_available"] or _next_midnight_pt())
+        return ("⏳ Лимит озвучки на сегодня исчерпан. Следующая озвучка будет "
+                "доступна после " + when + " (по вашему времени).")
     if _is_quota(err):
         return ("⏳ Сервис разбора текста сейчас ограничивает частоту запросов. "
                 "Подожди минуту и пришли то же самое ещё раз — дальше пойдёт.")
@@ -440,6 +697,37 @@ def tts_utterance(text: str, tag: str) -> bytes:
     raise last_err
 
 
+def tts_mono(utts, order, tags) -> bytes:
+    """ОДИН говорящий -> ОДИН запрос с одним голосом на весь текст.
+    Без этого одиночный диалог уходил в путь «по реплике» и тратил N запросов
+    вместо одного."""
+    sp = list(order)[0]
+    voice, instr = ROLE_VOICE[tags[sp]]
+    parts_text = [u["text"] for u in utts if u["speaker"] == sp]
+    if not parts_text:
+        parts_text = [u["text"] for u in utts]
+    text = " ".join(parts_text)
+    prompt = (instr + ". Read the following Arabic text aloud. "
+              "Modern Standard Arabic (fusha), clear diction, natural pace: " + text)
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name=voice))))
+    last_err = None
+    for attempt in range(1, TTS_MAX_RETRIES + 1):
+        try:
+            r = call_tts_model(prompt, config)
+            return r.candidates[0].content.parts[0].inline_data.data
+        except Exception as e:
+            if not _is_quota(e):
+                raise
+            last_err = e
+            time.sleep(_parse_retry_delay(e, default=30.0))
+    raise last_err
+
+
 def tts_dialogue_multispeaker(utts, order, tags) -> bytes:
     """ВЕСЬ диалог одним запросом: два голоса сразу, без склейки из кусков.
     Именно это снимает лимит частоты: 1 запрос на диалог вместо N запросов."""
@@ -506,6 +794,11 @@ def build_mp3(pcm_parts) -> bytes:
 
 def _friendly_error(err: Exception) -> str:
     """Понятное объяснение сбоя — без служебных названий сервисов."""
+    if isinstance(err, AllKeysExhausted):
+        s = quota_snapshot()
+        when = _fmt_local(s["next_available"] or _next_midnight_pt())
+        return ("⏳ Лимит озвучки на сегодня исчерпан. Следующая озвучка будет "
+                "доступна после " + when + " (по вашему времени).")
     if _is_quota(err):
         return (" Сервис озвучки сейчас ограничивает частоту запросов "
                 "(несколько в минуту). Подожди минуту — продолжим с того же места.")
@@ -548,23 +841,28 @@ async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     # Два персонажа -> ВЕСЬ диалог одним запросом (два голоса сразу).
     # Это главное лекарство от «ограничивает частоту запросов»:
     # вместо 19 обращений к сервису уходит ровно ОДНО.
-    if (len(st["order"]) == 2 and not st.get("pcm_parts")
+    n_spk = len(st["order"])
+    # 1 говорящий -> моно (1 запрос). 2 -> двухголосый (1 запрос).
+    # 3 и больше -> путь по репликам: сервис принимает максимум 2 голоса.
+    if (n_spk in (1, 2) and not st.get("pcm_parts")
             and st.get("cursor", 0) == 0):
         await context.bot.send_message(
             chat_id,
             "⏳Сабр — это половина веры.Озвучка идёт в несколько заходов, "
             "потом склеиваю. Жду — и ты жди.")
         try:
-            pcm = await asyncio.to_thread(
-                tts_dialogue_multispeaker, all_utts, st["order"], st["tags"])
+            fn = tts_dialogue_multispeaker if n_spk == 2 else tts_mono
+            pcm = await asyncio.to_thread(fn, all_utts, st["order"], st["tags"])
             mp3 = await asyncio.to_thread(pcm_to_mp3, pcm)
             speakers = " | ".join(
                 f"{sp}={TAG_LABEL[st['tags'][sp]]}" for sp in st["order"])
+            mode_txt = "два голоса" if n_spk == 2 else "один голос"
             st["cursor"] = total
+            cap = (f"🎧 Весь диалог целиком ({total} реплик, {mode_txt}) · "
+                   f"{speakers}")[:900]
             await context.bot.send_audio(
                 chat_id, audio=mp3, title="Озвучка диалога",
-                caption=f"🎧 Весь диалог целиком ({total} реплик) · "
-                        f"{speakers}"[:1000])
+                caption=cap + "\n\n" + _quota_footer())
             return
         except Exception as e:
             log.warning("двухголосый режим не сработал (%s) — перехожу "
@@ -630,9 +928,9 @@ async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                f"и я допишу следующие реплики в этот же диалог.")
     else:
         cap = f"🎧 Весь диалог целиком ({total} реплик) · {speakers}"
-    await context.bot.send_audio(chat_id, audio=mp3,
-                                 title="Озвучка диалога",
-                                 caption=cap[:1000])
+    await context.bot.send_audio(
+        chat_id, audio=mp3, title="Озвучка диалога",
+        caption=(cap[:900] + "\n\n" + _quota_footer())[:1024])
     if done < total:
         await context.bot.send_message(
             chat_id,
@@ -687,6 +985,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("diag", diag))
+    app.add_handler(CommandHandler("limits", limits_status))
+    app.add_handler(CommandHandler("stats", limits_status))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
