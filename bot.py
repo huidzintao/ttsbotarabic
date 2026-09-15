@@ -87,6 +87,14 @@ _last_tts_call = 0.0  # время последнего TTS-запроса (дл
 # Лимиты сервиса считаются НА ПРОЕКТ, а не на ключ. Несколько ключей одного
 # проекта лимит НЕ увеличивают — свободных запросов больше становится только
 # за счёт РАЗНЫХ проектов/аккаунтов. Ротация ниже — ровно для такого случая.
+class ServiceAccessError(Exception):
+    """Сервис отклонил доступ (401/403) — это не лимит и не «плохой ключ»."""
+
+    def __init__(self, cls="perm"):
+        super().__init__("доступ отклонён сервисом (" + cls + ")")
+        self.cls = cls
+
+
 class AllKeysExhausted(Exception):
     """Все ключи исчерпали суточную квоту (сброс — полночь по Тихоокеанскому времени)."""
 
@@ -161,19 +169,31 @@ def call_model(model: str, contents, config=None, kind: str = "tts"):
             return r
         except Exception as e:
             last_err = e
-            _bump(key, kind)          # отказ по лимиту тоже расходует квоту
-            if _is_quota(e) and _is_daily_quota(e):
+            _bump(key, kind)          # любая попытка расходует квоту
+            cls = _classify(e)
+            if cls == "allday":
                 _block(key, _next_midnight_pt())
                 free = sum(1 for k in GEMINI_API_KEYS
                            if key_blocked_until(k) <= time.time())
-                log.warning("Ключ %s исчерпал суточную квоту; свободных ещё: %d",
+                log.warning("Источник %s исчерпал суточную квоту; свободных ещё: %d",
                             _mask(key), free)
                 continue
+            if cls in ("auth", "perm"):
+                # Отказ доступа касается конкретного источника: уводим его в
+                # отпуск и молча пробуем следующий. Запрос не роняем.
+                _block(key, time.time() + KEY_COOLDOWN)
+                log.error("Источник %s: %s (HTTP %s) | %s", _mask(key), cls,
+                          _status_code(e), _redact(str(e))[:500])
+                continue
+            log.error("Ошибка запроса: %s (HTTP %s) | %s", cls, _status_code(e),
+                      _redact(str(e))[:500])
             raise
-    if _is_quota(last_err) and _is_daily_quota(last_err):
-        raise AllKeysExhausted("все ключи исчерпали суточную квоту") from last_err
+    cls = _classify(last_err)
+    if cls == "allday":
+        raise AllKeysExhausted("суточная квота исчерпана") from last_err
+    if cls in ("auth", "perm"):
+        raise ServiceAccessError(cls) from last_err
     raise last_err
-
 
 # ---------------- ОБЩИЙ СЧЁТЧИК ЛИМИТА (скрытно от пользователя) ----------------
 # Пользователь видит только «озвучено X из Y» и время следующей доступной
@@ -183,6 +203,7 @@ def call_model(model: str, contents, config=None, kind: str = "tts"):
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "usage_state.json"))
 RPD_PER_PROJECT = int(os.environ.get("RPD_PER_PROJECT", "10"))  # озвучек в сутки на один источник
+KEY_COOLDOWN = int(os.environ.get("KEY_COOLDOWN", "3600"))       # пауза источника при отказе 401/403
 TZ_NAME = os.environ.get("TZ_NAME", "Europe/Moscow")            # часовой пояс пользователя
 KEY_ID = {k: hashlib.sha1(k.encode()).hexdigest()[:10] for k in GEMINI_API_KEYS}
 _state_lock = threading.Lock()
@@ -316,6 +337,73 @@ def _quota_footer() -> str:
 
 
 _load_state()
+
+
+def _status_code(exc) -> int:
+    """Достаёт HTTP-код из ответа сервиса (по тексту или по атрибуту)."""
+    text = str(exc)
+    for c in (400, 401, 403, 404, 429, 500, 502, 503, 504):
+        if re.search(r"\b" + str(c) + r"\b", text):
+            return c
+    for attr in ("code", "status_code"):
+        try:
+            v = int(getattr(exc, attr))
+            if 100 <= v < 600:
+                return v
+        except Exception:
+            pass
+    return 0
+
+
+def _classify(exc) -> str:
+    """Разбирает сбой по существу: лимит / доступ / параметры / модель / сервер."""
+    if isinstance(exc, ServiceAccessError):
+        return exc.cls
+    if isinstance(exc, AllKeysExhausted):
+        return "allday"
+    low = str(exc).lower()
+    if _is_quota(exc):
+        return "allday" if _is_daily_quota(exc) else "rpm"
+    code = _status_code(exc)
+    if code == 401 or "unauthenticated" in low or "api key not valid" in low \
+            or "api_key_invalid" in low:
+        return "auth"
+    if code == 403 or "permission_denied" in low or "permission denied" in low:
+        return "perm"
+    if code == 400 or "invalid_argument" in low:
+        return "badreq"
+    if code == 404 or _is_model_gone(exc):
+        return "notfound"
+    if 500 <= code < 600:
+        return "server"
+    return "other"
+
+
+_ERR_CODE = {"allday": "E-LIMIT", "rpm": "E-429", "auth": "E-401", "perm": "E-403",
+             "badreq": "E-400", "notfound": "E-404", "server": "E-5xx"}
+
+
+def _err_code(exc) -> str:
+    """Короткий внутренний код: по нему видно причину и в чате, и в логах."""
+    return _ERR_CODE.get(_classify(exc), "E-000")
+
+
+def _redact(text: str) -> str:
+    """Вырезает ключи и токены: они не должны попадать ни в чат, ни в логи."""
+    text = re.sub(r"AIza[0-9A-Za-z_\-]{10,}", "AIza…СКРЫТО", str(text))
+    text = re.sub(r"\b\d{6,}:[\w\-]{15,}\b", "ТОКЕН…СКРЫТО", text)
+    return text
+
+
+def _is_owner(update) -> bool:
+    """Владелец (если задан OWNER_ID) — иначе диагностика открыта всем."""
+    owner = os.environ.get("OWNER_ID", "").strip()
+    if not owner:
+        return True
+    try:
+        return str(update.effective_user.id) == owner
+    except Exception:
+        return False
 
 
 # ----------------------- ВЫБОР МОДЕЛИ С ЗАПАСНЫМИ ВАРИАНТАМИ -----------------------
@@ -538,15 +626,41 @@ async def present(chat_id: int, utts, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------------- ОБРАБОТЧИКИ -----------------------
 
+def probe_tts() -> bool:
+    """Минимальный запрос озвучки: одно слово, один голос."""
+    config = genai.types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=genai.types.SpeechConfig(
+            voice_config=genai.types.VoiceConfig(
+                prebuilt_voice_config=genai.types.PrebuiltVoiceConfig(
+                    voice_name="Charon"))))
+    r = call_tts_model("Тест.", config)
+    return bool(r.candidates[0].content.parts[0].inline_data.data)
+
+
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка связи с сервисами: какая модель разметки сейчас отвечает."""
+    """Диагностика: какой этап ломается и что именно ответил сервис. Только владельцу."""
+    if not _is_owner(update):
+        await update.message.reply_text("Команда доступна только владельцу бота.")
+        return
+    rows, ok_text, ok_tts = [], False, False
     try:
         await asyncio.to_thread(call_text_model, "Ответь одним словом: ок")
-        await update.message.reply_text("✅ Озвучка и разбор диалога работают.")
+        ok_text = True
     except Exception as e:
-        await update.message.reply_text(
-            "❌ Сервис сейчас не отвечает.\n" + _tag_error_text(e))
-
+        rows.append("• разбор: " + _err_code(e) + " — " + _redact(str(e))[:220])
+    try:
+        await asyncio.to_thread(probe_tts)
+        ok_tts = True
+    except Exception as e:
+        rows.append("• озвучка: " + _err_code(e) + " — " + _redact(str(e))[:220])
+    head = "✅ Разбор диалога: работает" if ok_text else "❌ Разбор диалога: ошибка"
+    head += "\n" + ("✅ Озвучка: работает" if ok_tts else "❌ Озвучка: ошибка")
+    if rows:
+        head += "\n\n" + "\n".join(rows)
+    snap = quota_snapshot()
+    head += f"\n\nОзвучено сегодня: {snap['used']} из {snap['total']}"
+    await update.message.reply_text(head)
 
 async def limits_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Общий лимит озвучки на сутки — без каких-либо данных о ключах."""
@@ -593,13 +707,18 @@ def _tag_error_text(err: Exception, photo: bool = False) -> str:
     if _is_quota(err):
         return ("⏳ Сервис разбора текста сейчас ограничивает частоту запросов. "
                 "Подожди минуту и пришли то же самое ещё раз — дальше пойдёт.")
-    if _is_model_gone(err):
-        return ("⚠️ Модель разбора текста временно недоступна. "
-                "Попробуй ещё раз через пару минут.")
-    s = str(err).lower()
-    if "api key" in s or "api_key" in s or "401" in s or "403" in s or "unauth" in s:
-        return ("⚠️ Проблема с ключом доступа на стороне бота. "
-                "Напиши владельцу бота — нужно проверить ключ.")
+    cls = _classify(err)
+    code = _err_code(err)
+    if cls in ("auth", "perm"):
+        return ("⛔ " + code + ": сервис отклонил доступ. "
+                "Проверь настройки проекта: включён ли доступ у проекта и "
+                "подтверждён ли аккаунт (телефон, 2FA).")
+    if cls == "badreq":
+        return "⚠️ " + code + ": запрос отклонён — модель или формат данных."
+    if cls == "notfound":
+        return "⚠️ " + code + ": модель недоступна. Попробуй через пару минут."
+    if cls == "server":
+        return "⚠️ " + code + ": сбой на стороне сервиса. Попробуй через минуту."
     if photo:
         return ("Не смог распознать текст на фото.\n"
                 "Попробуй фото поярче/чётче или пришли диалог текстом.")
@@ -800,8 +919,19 @@ def _friendly_error(err: Exception) -> str:
         return ("⏳ Лимит озвучки на сегодня исчерпан. Следующая озвучка будет "
                 "доступна после " + when + " (по вашему времени).")
     if _is_quota(err):
-        return (" Сервис озвучки сейчас ограничивает частоту запросов "
+        return ("⏳ Сервис озвучки сейчас ограничивает частоту запросов "
                 "(несколько в минуту). Подожди минуту — продолжим с того же места.")
+    cls = _classify(err)
+    if cls in ("auth", "perm"):
+        return ("⛔ " + _err_code(err) + ": сервис отклонил доступ к озвучке. "
+                "Проверь настройки проекта: включён ли доступ к озвучке и "
+                "подтверждён ли аккаунт (телефон, 2FA).")
+    if cls == "badreq":
+        return "⚠️ E-400: запрос озвучки отклонён — модель или параметры."
+    if cls == "notfound":
+        return "⚠️ E-404: голосовая модель недоступна. Попробуй через пару минут."
+    if cls == "server":
+        return "⚠️ E-5xx: сбой на стороне сервиса. Попробуй через минуту."
     if _is_model_gone(err):
         return "⚠️ Голосовой движок переключился на резервный. Нажми ещё раз."
     if isinstance(err, ValueError):
