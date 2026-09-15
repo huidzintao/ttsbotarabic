@@ -129,19 +129,27 @@ def _remember(kind: str, model: str):
 
 
 def call_text_model(contents):
-    """Разбор ролей и распознавание фото: перебирает модели, пока не найдёт рабочую."""
+    """Разбор ролей и распознавание фото: перебирает модели, пока не найдёт рабочую.
+    Раньше падал сразу на 429 (лимит запросов): теперь ждёт паузу из ответа
+    и повторяет, а потом переходит к запасной модели."""
     last_err = None
     for m in _model_chain(TEXT_MODEL, TEXT_MODEL_FALLBACKS, "text"):
-        try:
-            r = client.models.generate_content(model=m, contents=contents)
-            _remember("text", m)
-            return r
-        except Exception as e:
-            if _is_model_gone(e):
-                log.warning("Модель '%s' недоступна, пробую следующую", m)
+        for attempt in range(2):
+            try:
+                r = client.models.generate_content(model=m, contents=contents)
+                _remember("text", m)
+                return r
+            except Exception as e:
                 last_err = e
-                continue
-            raise
+                if _is_model_gone(e):
+                    log.warning("Модель '%s' недоступна, пробую следующую", m)
+                    break
+                if _is_quota(e):
+                    wait = _parse_retry_delay(e, default=30.0)
+                    log.warning("429 quota у text-модели '%s', жду %.0f сек", m, wait)
+                    time.sleep(wait)
+                    continue
+                raise
     raise last_err
 
 
@@ -292,6 +300,18 @@ async def present(chat_id: int, utts, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------------- ОБРАБОТЧИКИ -----------------------
 
+async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка связи с сервисами: какая модель разметки сейчас отвечает."""
+    try:
+        await asyncio.to_thread(call_text_model, "Ответь одним словом: ок")
+        await update.message.reply_text(
+            f"✅ Разбор текста работает (модель: {_RESOLVED.get('text') or TEXT_MODEL}).")
+    except Exception as e:
+        hint = _tag_error_text(e)
+        await update.message.reply_text(
+            f"❌ Разбор текста не отвечает.\n{hint}")
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PENDING.pop(update.message.chat_id, None)
     await update.message.reply_text(
@@ -311,6 +331,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _tag_error_text(err: Exception, photo: bool = False) -> str:
+    """Сообщение об ошибке разметки с понятной причиной (без служебных названий)."""
+    if _is_quota(err):
+        return ("⏳ Сервис разбора текста сейчас ограничивает частоту запросов. "
+                "Подожди минуту и пришли то же самое ещё раз — дальше пойдёт.")
+    if _is_model_gone(err):
+        return ("⚠️ Модель разбора текста временно недоступна. "
+                "Попробуй ещё раз через пару минут.")
+    s = str(err).lower()
+    if "api key" in s or "api_key" in s or "401" in s or "403" in s or "unauth" in s:
+        return ("⚠️ Проблема с ключом доступа на стороне бота. "
+                "Напиши владельцу бота — нужно проверить ключ.")
+    if photo:
+        return ("Не смог распознать текст на фото.\n"
+                "Попробуй фото поярче/чётче или пришли диалог текстом.")
+    return "Не смог разобрать диалог. Пришли его ещё раз или разбей на две части."
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
@@ -323,9 +361,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         utts = tag_text(text)
     except Exception as e:
-        log.exception("tag_text failed")
-        await update.message.reply_text(
-            "Не смог разобрать диалог. Пришли его ещё раз или разбей на две части.")
+        log.exception("tag_text failed: %s", e)
+        await update.message.reply_text(_tag_error_text(e))
         return
     await present(update.message.chat_id, utts, context)
 
@@ -338,12 +375,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = await context.bot.get_file(photo.file_id)
         buf = io.BytesIO()
         await f.download_to_memory(buf)
-        utts = tag_photo(buf.getvalue(), "image/jpeg")
+        mime = "image/png" if (f.file_path or "").lower().endswith(".png") else "image/jpeg"
+        utts = tag_photo(buf.getvalue(), mime)
     except Exception as e:
-        log.exception("tag_photo failed")
-        await msg.reply_text(
-            "Не смог распознать текст на фото.\n"
-            "Попробуй фото поярче или пришли текстом.")
+        log.exception("tag_photo failed: %s", e)
+        await msg.reply_text(_tag_error_text(e, photo=True))
         return
     await present(msg.chat_id, utts, context)
 
@@ -583,6 +619,7 @@ def main():
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
