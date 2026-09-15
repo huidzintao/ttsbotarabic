@@ -440,11 +440,46 @@ def tts_utterance(text: str, tag: str) -> bytes:
     raise last_err
 
 
-def build_mp3(pcm_parts) -> bytes:
-    """Склейка реплик + конвертация в MP3. Запускается в отдельном потоке,
-    чтобы длинная работа не стопорила приём новых сообщений."""
-    silence = b"\x00\x00" * int(24000 * 0.45)  # 0.45 сек между репликами
-    pcm = silence.join(pcm_parts)
+def tts_dialogue_multispeaker(utts, order, tags) -> bytes:
+    """ВЕСЬ диалог одним запросом: два голоса сразу, без склейки из кусков.
+    Именно это снимает лимит частоты: 1 запрос на диалог вместо N запросов."""
+    pairs = list(order)[:2]
+    label = {sp: f"Speaker{i}" for i, sp in enumerate(pairs, 1)}
+    transcript = "\n".join(
+        f"{label.get(u['speaker'], 'Speaker1')}: {u['text']}" for u in utts)
+    prompt = ("Read aloud this Arabic dialogue between two people. "
+              "Modern Standard Arabic (fusha), clear diction, natural pace, "
+              "natural pauses between turns. Do not read the speaker labels.\n\n"
+              + transcript)
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
+                speaker_voice_configs=[
+                    types.SpeakerVoiceConfig(
+                        speaker=label[sp],
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=ROLE_VOICE[tags[sp]][0])))
+                    for sp in pairs])))
+    last_err = None
+    for attempt in range(1, TTS_MAX_RETRIES + 1):
+        try:
+            r = call_tts_model(prompt, config)
+            return r.candidates[0].content.parts[0].inline_data.data
+        except Exception as e:
+            if not _is_quota(e):
+                raise
+            last_err = e
+            wait = _parse_retry_delay(e, default=30.0)
+            log.warning("429 в двухголосом режиме (попытка %d/%d), жду %.0f сек",
+                        attempt, TTS_MAX_RETRIES, wait)
+            time.sleep(wait)
+    raise last_err
+
+
+def pcm_to_mp3(pcm: bytes) -> bytes:
+    """PCM 24 кГц mono -> MP3 64 kbps."""
     if not pcm:
         raise ValueError("нет аудио для склейки")
     with tempfile.TemporaryDirectory() as td:
@@ -461,6 +496,12 @@ def build_mp3(pcm_parts) -> bytes:
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(mp3_path, "rb") as f:
             return f.read()
+
+
+def build_mp3(pcm_parts) -> bytes:
+    """Склейка отдельных реплик в один MP3 (запасной путь: 3+ персонажа)."""
+    silence = b"\x00\x00" * int(24000 * 0.45)  # 0.45 сек между репликами
+    return pcm_to_mp3(silence.join(pcm_parts))
 
 
 def _friendly_error(err: Exception) -> str:
@@ -503,6 +544,32 @@ async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     all_utts = st["utterances"]
     total = len(all_utts)
+
+    # Два персонажа -> ВЕСЬ диалог одним запросом (два голоса сразу).
+    # Это главное лекарство от «ограничивает частоту запросов»:
+    # вместо 19 обращений к сервису уходит ровно ОДНО.
+    if (len(st["order"]) == 2 and not st.get("pcm_parts")
+            and st.get("cursor", 0) == 0):
+        await context.bot.send_message(
+            chat_id,
+            "⏳Сабр — это половина веры.Озвучка идёт в несколько заходов, "
+            "потом склеиваю. Жду — и ты жди.")
+        try:
+            pcm = await asyncio.to_thread(
+                tts_dialogue_multispeaker, all_utts, st["order"], st["tags"])
+            mp3 = await asyncio.to_thread(pcm_to_mp3, pcm)
+            speakers = " | ".join(
+                f"{sp}={TAG_LABEL[st['tags'][sp]]}" for sp in st["order"])
+            st["cursor"] = total
+            await context.bot.send_audio(
+                chat_id, audio=mp3, title="Озвучка диалога",
+                caption=f"🎧 Весь диалог целиком ({total} реплик) · "
+                        f"{speakers}"[:1000])
+            return
+        except Exception as e:
+            log.warning("двухголосый режим не сработал (%s) — перехожу "
+                        "к озвучке по репликам", e)
+            # не выходим: ниже сработает обычный путь по репликам
     start = st.get("cursor", 0)
     if start >= total:            # весь диалог уже озвучен -> начинаем заново
         start = 0
