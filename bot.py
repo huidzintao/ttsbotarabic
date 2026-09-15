@@ -292,6 +292,12 @@ async def present(chat_id: int, utts, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------------- ОБРАБОТЧИКИ -----------------------
 
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    PENDING.pop(update.message.chat_id, None)
+    await update.message.reply_text(
+        "Начнём заново. Пришли диалог текстом или фото страницы учебника.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "السلام عليكم! 👋\n\n"
@@ -398,6 +404,61 @@ def tts_utterance(text: str, tag: str) -> bytes:
     raise last_err
 
 
+def build_mp3(pcm_parts) -> bytes:
+    """Склейка реплик + конвертация в MP3. Запускается в отдельном потоке,
+    чтобы длинная работа не стопорила приём новых сообщений."""
+    silence = b"\x00\x00" * int(24000 * 0.45)  # 0.45 сек между репликами
+    pcm = silence.join(pcm_parts)
+    if not pcm:
+        raise ValueError("нет аудио для склейки")
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "out.wav")
+        mp3_path = os.path.join(td, "out.mp3")
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(pcm)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
+             "-b:a", "64k", "-ac", "1", mp3_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(mp3_path, "rb") as f:
+            return f.read()
+
+
+def _friendly_error(err: Exception) -> str:
+    """Понятное объяснение сбоя — без служебных названий сервисов."""
+    if _is_quota(err):
+        return (" Сервис озвучки сейчас ограничивает частоту запросов "
+                "(несколько в минуту). Подожди минуту — продолжим с того же места.")
+    if _is_model_gone(err):
+        return "⚠️ Голосовой движок переключился на резервный. Нажми ещё раз."
+    if isinstance(err, ValueError):
+        return "⚠️ Нечего склеивать: реплики не записались."
+    return "⚠️ Сбой на стороне сервиса озвучки. Попробуй ещё раз через минуту."
+
+
+async def report_failure(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                         err: Exception, st: dict, total: int):
+    """Говорит, на чём прервались, и ВСЕГДА возвращает кнопку продолжения.
+    Без этого после сбоя в чате не остаётся кнопок и бот кажется мёртвым."""
+    done = int(st.get("cursor", 0) or 0)
+    head = _friendly_error(err)
+    if done <= 0:
+        tail = "\n\nНажми «✅ Озвучить», чтобы попробовать снова."
+    elif done < total:
+        tail = (f"\n\nЗаписано {done} из {total} реплик. "
+                f"Нажми «▶️ Продолжить» — допишу остальные в тот же файл.")
+    else:
+        tail = "\n\nВсе реплики записаны, осталась склейка. Нажми «🔄 Озвучить заново»."
+    try:
+        await context.bot.send_message(chat_id, head + tail,
+                                       reply_markup=build_keyboard(chat_id))
+    except Exception:
+        log.exception("не смог отправить сообщение об ошибке")
+
+
 async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = PENDING.get(chat_id)
     if not st:
@@ -436,7 +497,11 @@ async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     chat_id, f"⏳ Реплика {pos}/{total} — готовлю звук…")
             if wait > 0:
                 await asyncio.sleep(wait)
-            st["pcm_parts"].append(tts_utterance(u["text"], u["tag"]))
+            # Реплика целиком (включая паузы-ретраи) выполняется в потоке:
+            # синхронный time.sleep внутри async-хендлера замораживал бота,
+            # и он переставал отвечать даже на /start.
+            part = await asyncio.to_thread(tts_utterance, u["text"], u["tag"])
+            st["pcm_parts"].append(part)
             _last_tts_call = time.monotonic()
             st["cursor"] = pos      # при сбое продолжим с этого места
             if n % 3 == 0:
@@ -444,27 +509,15 @@ async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     chat_id, f"⏳ {pos}/{total} реплик готово…")
     except Exception as e:
         log.exception("tts failed")
-        await context.bot.send_message(
-            chat_id, "Не получилось озвучить: временный сбой. "
-                     "Попробуй ещё раз через минуту.")
+        await report_failure(chat_id, context, e, st, total)
         return
 
-    silence = b"\x00\x00" * int(24000 * 0.45)  # 0.45 сек между репликами
-    pcm = silence.join(st["pcm_parts"])
-    with tempfile.TemporaryDirectory() as td:
-        wav_path = os.path.join(td, "out.wav")
-        mp3_path = os.path.join(td, "out.mp3")
-        with wave.open(wav_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(24000)
-            wf.writeframes(pcm)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
-             "-b:a", "64k", "-ac", "1", mp3_path],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open(mp3_path, "rb") as f:
-            mp3 = f.read()
+    try:
+        mp3 = await asyncio.to_thread(build_mp3, st["pcm_parts"])
+    except Exception as e:
+        log.exception("mp3 build failed")
+        await report_failure(chat_id, context, e, st, total)
+        return
 
     speakers = " | ".join(f"{sp}={TAG_LABEL[st['tags'][sp]]}" for sp in st["order"])
     done = st["cursor"]
@@ -529,6 +582,7 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
