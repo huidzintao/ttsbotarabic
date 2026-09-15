@@ -9,6 +9,7 @@ Telegram-бот озвучки арабских диалогов через Gemi
 3. Перед генерацией показывает кнопки: пользователь одним нажатием меняет пол/возраст персонажа.
 """
 
+import asyncio
 import io
 import json
 import logging
@@ -17,6 +18,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -68,6 +70,14 @@ MAX_CHARS = int(os.environ.get("MAX_CHARS", "4000"))
 # По умолчанию 0: не теряем сообщения, отправленные пока сервис спал.
 DROP_PENDING = os.environ.get("DROP_PENDING", "0") == "1"
 
+# ---- Лимиты FREE TIER Gemini: 3 TTS-запроса в минуту на проект ----
+# Поэтому озвучка идёт «по одной реплике с паузой», а не пачкой.
+TTS_RPM_LIMIT = int(os.environ.get("TTS_RPM_LIMIT", "3"))
+TTS_MIN_INTERVAL = float(os.environ.get("TTS_MIN_INTERVAL", "22"))  # сек между запросами
+TTS_MAX_CHUNKS = int(os.environ.get("TTS_MAX_CHUNKS", "8"))        # реплик за один прогон
+TTS_MAX_RETRIES = int(os.environ.get("TTS_MAX_RETRIES", "3"))
+_last_tts_call = 0.0  # время последнего TTS-запроса (для ограничителя темпа)
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -76,6 +86,24 @@ def _is_model_gone(exc: Exception) -> bool:
     """True, если ошибка означает «модель не обслуживается» (404 / NOT_FOUND)."""
     s = str(exc)
     return ("404" in s) or ("NOT_FOUND" in s) or ("no longer available" in s)
+
+
+def _is_quota(exc: Exception) -> bool:
+    """True для 429 / RESOURCE_EXHAUSTED — временный лимит запросов."""
+    s = str(exc)
+    return (("429" in s) or ("RESOURCE_EXHAUSTED" in s)
+            or ("exceeded your current quota" in s))
+
+
+def _parse_retry_delay(exc: Exception, default: float = 25.0) -> float:
+    """Достаёт из ответа Google рекомендованную паузу ('retryDelay': '34s')."""
+    s = str(exc)
+    m = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", s)
+    if not m:
+        m = re.search(r"retry in (\d+(?:\.\d+)?)s", s, flags=re.I)
+    if m:
+        return min(float(m.group(1)) + 2.0, 65.0)
+    return default
 
 
 # Запоминаем уже найденную рабочую модель, чтобы не долбиться в битую на каждой реплике.
@@ -329,31 +357,69 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------- TTS -----------------------
 
 def tts_utterance(text: str, tag: str) -> bytes:
+    """Одна реплика. При 429 ждёт столько, сколько просит Google, и повторяет."""
     voice, instr = ROLE_VOICE[tag]
     prompt = (f"{instr}. Modern Standard Arabic (fusha), clear diction, "
               f"natural pace: {text}")
-    r = call_tts_model(
-        prompt,
-        types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=voice)))))
-    return r.candidates[0].content.parts[0].inline_data.data
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name=voice))))
+    last_err = None
+    for attempt in range(1, TTS_MAX_RETRIES + 1):
+        try:
+            r = call_tts_model(prompt, config)
+            return r.candidates[0].content.parts[0].inline_data.data
+        except Exception as e:
+            if not _is_quota(e):
+                raise
+            last_err = e
+            wait = _parse_retry_delay(e, default=max(20.0, TTS_MIN_INTERVAL))
+            log.warning("429 quota (попытка %d/%d), жду %.0f сек",
+                        attempt, TTS_MAX_RETRIES, wait)
+            time.sleep(wait)
+    raise last_err
 
 
 async def generate_and_send(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = PENDING.get(chat_id)
     if not st:
         return
+    global _last_tts_call
+
     utts = st["utterances"]
+    total = len(utts)
+    if total > TTS_MAX_CHUNKS:
+        utts = utts[:TTS_MAX_CHUNKS]
+        await context.bot.send_message(
+            chat_id,
+            f"ℹ️ В диалоге {total} реплик — за один прогон озвучиваю первые "
+            f"{TTS_MAX_CHUNKS} (ограничение free tier Gemini). "
+            f"Пришли остаток отдельным сообщением.")
     silence = b"\x00\x00" * int(24000 * 0.45)  # 0.45 сек между репликами
     chunks = []
+
+    est_min = max(0.0, (len(utts) - 1) * TTS_MIN_INTERVAL) / 60.0
+    if est_min >= 0.4:
+        await context.bot.send_message(
+            chat_id,
+            f"🐢 Free tier Gemini даёт {TTS_RPM_LIMIT} TTS-запроса в минуту, "
+            f"поэтому {len(utts)} реплик озвучиваются по очереди "
+            f"(≈{est_min:.1f} мин). Не закрывай чат — пришлю MP3, когда закончу.")
     try:
         for i, u in enumerate(utts, 1):
+            wait = TTS_MIN_INTERVAL - (time.monotonic() - _last_tts_call)
+            if wait > 5 and i > 1:
+                await context.bot.send_message(
+                    chat_id, f"⏳ Жду {wait:.0f} сек, чтобы не упереться "
+                             f"в лимит… затем реплика {i}/{len(utts)}")
+            if wait > 0:
+                await asyncio.sleep(wait)
             chunks.append(tts_utterance(u["text"], u["tag"]))
-            if i % 5 == 0:
+            _last_tts_call = time.monotonic()
+            if i % 3 == 0:
                 await context.bot.send_message(
                     chat_id, f"⏳ {i}/{len(utts)} реплик готово…")
     except Exception as e:
